@@ -14,6 +14,7 @@ from app.application.indicators import RtcIndicatorService
 from app.application.queries import RtcQueryService
 from app.application.rtc_import import RtcImportPipeline
 from app.application.rtc_import_service import RtcImportService
+from app.infrastructure.config import AppPaths
 from app.infrastructure.rtc_persistence import RtcPersistence
 from app.ui.dashboard import DashboardWidget
 from app.ui.import_summary import ImportSummaryDialog
@@ -48,7 +49,8 @@ class MainWindow(QMainWindow):
         self.resize(1200, 720)
         self.thread_pool = QThreadPool.globalInstance()
         self.files: list[Path] = []
-        self.persistence = RtcPersistence("sqlite:///siap_rtc.db")
+        self.paths = AppPaths.from_environment().ensure()
+        self.persistence = RtcPersistence(f"sqlite:///{self.paths.database.as_posix()}")
         self.import_service = EndToEndImportService(
             RtcImportService(RtcImportPipeline(), self.persistence)
         )
