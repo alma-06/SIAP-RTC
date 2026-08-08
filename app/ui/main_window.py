@@ -2,10 +2,24 @@
 
 from __future__ import annotations
 
+import hashlib
 from pathlib import Path
 
 from PySide6.QtCore import QObject, QRunnable, QThreadPool, Signal
-from PySide6.QtWidgets import QApplication, QFileDialog, QLabel, QListWidget, QMainWindow, QMessageBox, QProgressBar, QStackedWidget, QToolBar, QVBoxLayout, QPushButton, QWidget
+from PySide6.QtWidgets import (
+    QApplication,
+    QFileDialog,
+    QLabel,
+    QListWidget,
+    QMainWindow,
+    QMessageBox,
+    QProgressBar,
+    QStackedWidget,
+    QToolBar,
+    QVBoxLayout,
+    QPushButton,
+    QWidget,
+)
 from sqlalchemy.orm import Session
 
 from app.application.e2e_import import EndToEndImportService
@@ -38,6 +52,14 @@ class ImportWorker(QRunnable):
             self.signals.finished.emit(self.service.execute(self.files))
         except Exception as exc:
             self.signals.failed.emit(str(exc))
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 class MainWindow(QMainWindow):
@@ -93,11 +115,22 @@ class MainWindow(QMainWindow):
         return page
 
     def select_files(self) -> None:
-        selected, _ = QFileDialog.getOpenFileNames(self, "Seleccionar archivos RTC", "", "Excel (*.xlsx *.xlsm)")
+        selected, _ = QFileDialog.getOpenFileNames(
+            self,
+            "Seleccionar archivos RTC",
+            "",
+            "Excel (*.xlsx *.xlsm)",
+        )
         self.files = [Path(item) for item in selected]
         self.file_list.clear()
-        self.file_list.addItems([str(path) for path in self.files])
-        self.status.setText(f"{len(self.files)} archivo(s) seleccionado(s).")
+        for path in self.files:
+            try:
+                size = path.stat().st_size
+                fingerprint = sha256_file(path)
+                self.file_list.addItem(f"{path.name} | {size:,} bytes | SHA-256 {fingerprint[:16]}…")
+            except OSError as exc:
+                self.file_list.addItem(f"{path.name} | ERROR: {exc}")
+        self.status.setText(f"{len(self.files)} archivo(s) seleccionado(s). Huellas calculadas.")
 
     def clear_files(self) -> None:
         self.files.clear()
@@ -107,6 +140,15 @@ class MainWindow(QMainWindow):
     def process_files(self) -> None:
         if not self.files:
             QMessageBox.information(self, "SIAP-RTC", "Seleccione al menos un archivo RTC.")
+            return
+        missing = [str(path) for path in self.files if not path.is_file()]
+        if missing:
+            QMessageBox.warning(
+                self,
+                "Archivos no disponibles",
+                "No se puede procesar porque uno o más archivos ya no existen:\n\n"
+                + "\n".join(missing),
+            )
             return
         self.progress.show()
         self.status.setText("Validando, deduplicando y guardando en histórico…")
