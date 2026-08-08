@@ -1,84 +1,90 @@
-"""Initial PySide6 desktop shell for SIAP-RTC."""
+"""Operational PySide6 window for SIAP-RTC."""
 
 from __future__ import annotations
 
 from pathlib import Path
 
 from PySide6.QtCore import QObject, QRunnable, QThreadPool, Signal
-from PySide6.QtWidgets import (
-    QApplication, QFileDialog, QHBoxLayout, QLabel, QListWidget, QMainWindow,
-    QMessageBox, QPushButton, QProgressBar, QVBoxLayout, QWidget,
-)
+from PySide6.QtWidgets import QApplication, QFileDialog, QLabel, QListWidget, QMainWindow, QMessageBox, QProgressBar, QStackedWidget, QToolBar, QVBoxLayout, QPushButton, QWidget
+from sqlalchemy.orm import Session
 
+from app.application.indicators import RtcIndicatorService
+from app.application.queries import RtcQueryService
 from app.application.rtc_import import RtcImportPipeline
+from app.infrastructure.rtc_persistence import RtcPersistence
+from app.ui.dashboard import DashboardWidget
+from app.ui.query_panel import QueryPanel
 
 
-class ImportWorkerSignals(QObject):
+class WorkerSignals(QObject):
     finished = Signal(object)
     failed = Signal(str)
 
 
 class ImportWorker(QRunnable):
-    """Run the import pipeline off the GUI thread."""
-
     def __init__(self, files: list[Path]) -> None:
         super().__init__()
         self.files = files
-        self.signals = ImportWorkerSignals()
+        self.signals = WorkerSignals()
 
     def run(self) -> None:
         try:
-            result = RtcImportPipeline().run(self.files)
-            self.signals.finished.emit(result)
-        except Exception as exc:  # pragma: no cover - GUI safety boundary
+            self.signals.finished.emit(RtcImportPipeline().run(self.files))
+        except Exception as exc:
             self.signals.failed.emit(str(exc))
 
 
 class MainWindow(QMainWindow):
-    """Main application window for the SIAP-RTC desktop client."""
+    """Desktop client with import, dashboard and historical query views."""
 
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("SIAP-RTC | Sistema de Información de Pautado RTC")
-        self.resize(980, 650)
+        self.resize(1200, 720)
         self.thread_pool = QThreadPool.globalInstance()
         self.files: list[Path] = []
+        self.persistence = RtcPersistence("sqlite:///siap_rtc.db")
         self._build_ui()
+        self.refresh_dashboard()
 
     def _build_ui(self) -> None:
-        central = QWidget()
-        layout = QVBoxLayout(central)
-        title = QLabel("SIAP-RTC")
-        subtitle = QLabel("Importación y análisis histórico de pautado de la Cámara de Senadores")
-        self.file_list = QListWidget()
-        self.progress = QProgressBar()
-        self.progress.setRange(0, 0)
-        self.progress.hide()
-        self.status = QLabel("Seleccione uno o varios archivos Excel de RTC.")
+        toolbar = QToolBar("Navegación")
+        self.addToolBar(toolbar)
+        for title, index in (("Inicio", 0), ("Importar RTC", 1), ("Histórico", 2)):
+            action = toolbar.addAction(title)
+            action.triggered.connect(lambda checked=False, i=index: self.stack.setCurrentIndex(i))
 
-        buttons = QHBoxLayout()
+        self.stack = QStackedWidget()
+        self.dashboard = DashboardWidget()
+        self.import_page = self._build_import_page()
+        self.query = QueryPanel()
+        self.query.query_requested.connect(self.execute_query)
+        self.stack.addWidget(self.dashboard)
+        self.stack.addWidget(self.import_page)
+        self.stack.addWidget(self.query)
+        self.setCentralWidget(self.stack)
+
+    def _build_import_page(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.addWidget(QLabel("Importación de archivos RTC"))
+        self.file_list = QListWidget()
         select = QPushButton("Seleccionar archivos RTC")
         select.clicked.connect(self.select_files)
-        process = QPushButton("Procesar")
+        process = QPushButton("Procesar y validar")
         process.clicked.connect(self.process_files)
         clear = QPushButton("Limpiar")
         clear.clicked.connect(self.clear_files)
-        buttons.addWidget(select)
-        buttons.addWidget(process)
-        buttons.addWidget(clear)
-
-        layout.addWidget(title)
-        layout.addWidget(subtitle)
-        layout.addLayout(buttons)
-        layout.addWidget(self.file_list)
-        layout.addWidget(self.progress)
-        layout.addWidget(self.status)
-        self.setCentralWidget(central)
+        self.progress = QProgressBar()
+        self.progress.setRange(0, 0)
+        self.progress.hide()
+        self.status = QLabel("Seleccione uno o varios archivos Excel.")
+        for widget in (select, process, clear, self.file_list, self.progress, self.status):
+            layout.addWidget(widget)
+        return page
 
     def select_files(self) -> None:
-        selected, _ = QFileDialog.getOpenFileNames(
-            self, "Seleccionar archivos RTC", "", "Excel (*.xlsx *.xlsm)"
-        )
+        selected, _ = QFileDialog.getOpenFileNames(self, "Seleccionar archivos RTC", "", "Excel (*.xlsx *.xlsm)")
         self.files = [Path(item) for item in selected]
         self.file_list.clear()
         self.file_list.addItems([str(path) for path in self.files])
@@ -87,7 +93,7 @@ class MainWindow(QMainWindow):
     def clear_files(self) -> None:
         self.files.clear()
         self.file_list.clear()
-        self.status.setText("Seleccione uno o varios archivos Excel de RTC.")
+        self.status.setText("Seleccione uno o varios archivos Excel.")
 
     def process_files(self) -> None:
         if not self.files:
@@ -96,21 +102,27 @@ class MainWindow(QMainWindow):
         self.progress.show()
         self.status.setText("Procesando archivos…")
         worker = ImportWorker(self.files)
-        worker.signals.finished.connect(self.on_import_finished)
-        worker.signals.failed.connect(self.on_import_failed)
+        worker.signals.finished.connect(self.import_finished)
+        worker.signals.failed.connect(self.import_failed)
         self.thread_pool.start(worker)
 
-    def on_import_finished(self, result: object) -> None:
+    def import_finished(self, result: object) -> None:
         self.progress.hide()
-        self.status.setText(
-            f"Filas leídas: {result.rows_read} | Aceptadas: {len(result.accepted)} | "
-            f"Duplicadas: {result.duplicates} | Rechazadas: {result.rejected}"
-        )
+        self.status.setText(f"Leídas: {result.rows_read} | Aceptadas: {len(result.accepted)} | Duplicadas: {result.duplicates} | Rechazadas: {result.rejected}")
+        self.refresh_dashboard()
 
-    def on_import_failed(self, message: str) -> None:
+    def import_failed(self, message: str) -> None:
         self.progress.hide()
-        self.status.setText("La importación terminó con error.")
         QMessageBox.critical(self, "Error de importación", message)
+
+    def refresh_dashboard(self) -> None:
+        with Session(self.persistence.engine) as session:
+            self.dashboard.update_indicators(RtcIndicatorService(session).summary())
+
+    def execute_query(self, payload: dict) -> None:
+        with Session(self.persistence.engine) as session:
+            records = RtcQueryService(session).list_records(**payload)
+            self.query.set_records(records)
 
 
 def run() -> int:
