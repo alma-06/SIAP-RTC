@@ -35,7 +35,7 @@ class ImportOrchestrator:
 
         transaction = ImportTransaction(self.database_path)
         try:
-            with transaction.begin(batch_id) as connection:
+            with transaction.begin(batch_id, started_at=batch.started_at) as connection:
                 for item in validation:
                     result = self._process_file(
                         connection, item.path, item.sha256, batch_id
@@ -56,7 +56,7 @@ class ImportOrchestrator:
         self, connection, path: Path, sha256: str, batch_id: str
     ) -> FileImportResult:
         normalized = self.reader.read(path)
-        accepted, decisions = self.cam_sen_filter.filter(normalized)
+        accepted, _decisions = self.cam_sen_filter.filter(normalized)
         new_records = 0
         duplicates = 0
 
