@@ -8,11 +8,15 @@ from PySide6.QtCore import QObject, QRunnable, QThreadPool, Signal
 from PySide6.QtWidgets import QApplication, QFileDialog, QLabel, QListWidget, QMainWindow, QMessageBox, QProgressBar, QStackedWidget, QToolBar, QVBoxLayout, QPushButton, QWidget
 from sqlalchemy.orm import Session
 
+from app.application.e2e_import import EndToEndImportService
+from app.application.import_report import ImportReport
 from app.application.indicators import RtcIndicatorService
 from app.application.queries import RtcQueryService
 from app.application.rtc_import import RtcImportPipeline
+from app.application.rtc_import_service import RtcImportService
 from app.infrastructure.rtc_persistence import RtcPersistence
 from app.ui.dashboard import DashboardWidget
+from app.ui.import_summary import ImportSummaryDialog
 from app.ui.query_panel import QueryPanel
 
 
@@ -22,20 +26,21 @@ class WorkerSignals(QObject):
 
 
 class ImportWorker(QRunnable):
-    def __init__(self, files: list[Path]) -> None:
+    def __init__(self, service: EndToEndImportService, files: list[Path]) -> None:
         super().__init__()
+        self.service = service
         self.files = files
         self.signals = WorkerSignals()
 
     def run(self) -> None:
         try:
-            self.signals.finished.emit(RtcImportPipeline().run(self.files))
+            self.signals.finished.emit(self.service.execute(self.files))
         except Exception as exc:
             self.signals.failed.emit(str(exc))
 
 
 class MainWindow(QMainWindow):
-    """Desktop client with import, dashboard and historical query views."""
+    """Desktop client with persistent E2E RTC import, dashboard and history query."""
 
     def __init__(self) -> None:
         super().__init__()
@@ -44,6 +49,9 @@ class MainWindow(QMainWindow):
         self.thread_pool = QThreadPool.globalInstance()
         self.files: list[Path] = []
         self.persistence = RtcPersistence("sqlite:///siap_rtc.db")
+        self.import_service = EndToEndImportService(
+            RtcImportService(RtcImportPipeline(), self.persistence)
+        )
         self._build_ui()
         self.refresh_dashboard()
 
@@ -53,7 +61,6 @@ class MainWindow(QMainWindow):
         for title, index in (("Inicio", 0), ("Importar RTC", 1), ("Histórico", 2)):
             action = toolbar.addAction(title)
             action.triggered.connect(lambda checked=False, i=index: self.stack.setCurrentIndex(i))
-
         self.stack = QStackedWidget()
         self.dashboard = DashboardWidget()
         self.import_page = self._build_import_page()
@@ -71,7 +78,7 @@ class MainWindow(QMainWindow):
         self.file_list = QListWidget()
         select = QPushButton("Seleccionar archivos RTC")
         select.clicked.connect(self.select_files)
-        process = QPushButton("Procesar y validar")
+        process = QPushButton("Procesar y guardar en histórico")
         process.clicked.connect(self.process_files)
         clear = QPushButton("Limpiar")
         clear.clicked.connect(self.clear_files)
@@ -100,15 +107,19 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "SIAP-RTC", "Seleccione al menos un archivo RTC.")
             return
         self.progress.show()
-        self.status.setText("Procesando archivos…")
-        worker = ImportWorker(self.files)
+        self.status.setText("Validando, deduplicando y guardando en histórico…")
+        worker = ImportWorker(self.import_service, self.files)
         worker.signals.finished.connect(self.import_finished)
         worker.signals.failed.connect(self.import_failed)
         self.thread_pool.start(worker)
 
-    def import_finished(self, result: object) -> None:
+    def import_finished(self, report: ImportReport) -> None:
         self.progress.hide()
-        self.status.setText(f"Leídas: {result.rows_read} | Aceptadas: {len(result.accepted)} | Duplicadas: {result.duplicates} | Rechazadas: {result.rejected}")
+        self.status.setText(
+            f"Leídas: {report.rows_read} | Aceptadas: {report.accepted} | "
+            f"Duplicadas: {report.duplicates} | Rechazadas: {report.rejected}"
+        )
+        ImportSummaryDialog(report).exec()
         self.refresh_dashboard()
 
     def import_failed(self, message: str) -> None:
