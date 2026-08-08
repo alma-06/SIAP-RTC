@@ -3,25 +3,41 @@ from __future__ import annotations
 from contextlib import contextmanager
 from pathlib import Path
 from collections.abc import Iterator, Mapping
+from datetime import datetime, timezone
 import sqlite3
 
 from app.domain.record_identity import record_identity_hash
 
 
 class ImportTransaction:
-    """Coordinates historical inserts and duplicate evidence in one SQLite transaction."""
+    """Coordinates an RTC batch, historical inserts and duplicate evidence transactionally."""
 
     def __init__(self, database_path: Path) -> None:
         self.database_path = database_path
         self.database_path.parent.mkdir(parents=True, exist_ok=True)
 
-    @contextmanager
-    def begin(self, batch_id: str) -> Iterator[sqlite3.Connection]:
+    def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.database_path)
         connection.execute("PRAGMA foreign_keys = ON")
+        return connection
+
+    @contextmanager
+    def begin(self, batch_id: str, started_at: datetime | None = None) -> Iterator[sqlite3.Connection]:
+        connection = self._connect()
         try:
             connection.execute("BEGIN")
+            connection.execute(
+                """
+                INSERT INTO import_batches(batch_id, started_at, status)
+                VALUES (?, ?, 'INICIADO')
+                """,
+                (batch_id, (started_at or datetime.now(timezone.utc)).isoformat()),
+            )
             yield connection
+            connection.execute(
+                "UPDATE import_batches SET status = 'PROCESADO' WHERE batch_id = ?",
+                (batch_id,),
+            )
             connection.commit()
         except Exception:
             connection.rollback()
