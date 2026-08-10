@@ -58,6 +58,9 @@ class HistoricalRepository:
                 CREATE INDEX IF NOT EXISTS idx_historical_fecha ON historical_records(fecha);
                 CREATE INDEX IF NOT EXISTS idx_historical_campana ON historical_records(campana);
                 CREATE INDEX IF NOT EXISTS idx_historical_source_batch ON historical_records(source_batch_id);
+                CREATE INDEX IF NOT EXISTS idx_historical_version ON historical_records(version);
+                CREATE INDEX IF NOT EXISTS idx_historical_canal ON historical_records(canal_base);
+                CREATE INDEX IF NOT EXISTS idx_historical_clave ON historical_records(clave);
                 """
             )
 
@@ -81,7 +84,7 @@ class HistoricalRepository:
             )
         return cursor.rowcount == 1
 
-    def search(self, filters: HistoricalQueryFilters) -> tuple[list[dict[str, object]], int]:
+    def _where_clause(self, filters: HistoricalQueryFilters) -> tuple[str, list[object]]:
         where: list[str] = []
         params: list[object] = []
         if filters.date_from:
@@ -99,7 +102,10 @@ class HistoricalRepository:
             if value:
                 where.append(f"{column} = ?")
                 params.append(value)
-        where_sql = f" WHERE {' AND '.join(where)}" if where else ""
+        return (f" WHERE {' AND '.join(where)}" if where else ""), params
+
+    def search(self, filters: HistoricalQueryFilters) -> tuple[list[dict[str, object]], int]:
+        where_sql, params = self._where_clause(filters)
         order_column = ALLOWED_SORT_COLUMNS.get(filters.sort_by)
         if not order_column:
             raise ValueError(f"sort_by no permitido: {filters.sort_by}")
@@ -115,3 +121,35 @@ class HistoricalRepository:
                 [*params, filters.limit, filters.offset],
             ).fetchall()
         return [dict(row) for row in rows], total
+
+    def metrics(self, filters: HistoricalQueryFilters) -> dict[str, object]:
+        where_sql, params = self._where_clause(filters)
+
+        def grouped(expression: str, dimension: str) -> list[dict[str, object]]:
+            with self._connect() as connection:
+                rows = connection.execute(
+                    f"SELECT {expression} AS value, COUNT(*) AS count "
+                    f"FROM historical_records{where_sql} "
+                    f"GROUP BY {expression} ORDER BY count DESC, value ASC",
+                    params,
+                ).fetchall()
+            return [{"dimension": dimension, "value": row["value"] or "(SIN DATO)", "count": row["count"]} for row in rows]
+
+        with self._connect() as connection:
+            total = connection.execute(
+                f"SELECT COUNT(*) FROM historical_records{where_sql}", params
+            ).fetchone()[0]
+            duplicate_sql = "SELECT COUNT(*) FROM duplicate_audit"
+            duplicates = connection.execute(duplicate_sql).fetchone()[0]
+
+        return {
+            "total": total,
+            "by_period": grouped("substr(fecha, 1, 7)", "periodo"),
+            "by_campaign": grouped("campana", "campana"),
+            "by_version": grouped("version", "version"),
+            "by_channel": grouped("canal_base", "canal_base"),
+            "by_state": grouped("estado", "estado"),
+            "by_key": grouped("clave", "clave"),
+            "by_batch": grouped("source_batch_id", "batch_id"),
+            "duplicates": duplicates,
+        }
